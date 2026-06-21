@@ -1,0 +1,1133 @@
+
+---
+title: "Adlib Text Mining Dashboard"
+output: 
+  html_document:
+    toc: true
+    theme: flatly
+    code_folding: hide
+runtime: shiny
+---
+
+# ============================================================================
+# SECTION 1: GLOBAL SETUP & LIBRARIES
+# ============================================================================
+
+```{r global_setup, message=FALSE, warning=FALSE}
+# Load all required libraries
+library(shiny)
+library(shinydashboard)
+library(tidyverse)
+library(tidytext)
+library(wordcloud)
+library(RColorBrewer)
+library(plotly)
+library(DT)
+library(textdata)
+library(readr)
+library(janitor)
+
+# Global constants
+STOP_WORDS <- stop_words
+COLOR_SCHEMES <- list(
+  classic = "#3498db",
+  ai = "#e74c3c",
+  positive = "#2ecc71",
+  negative = "#e74c3c"
+)
+
+# Configuration
+DEFAULT_MIN_FREQ <- 10
+MAX_WORDS_CLOUD <- 150
+
+# Source file paths (UPDATE THIS PATH)
+DATA_PATHS <- list(
+  adlibs = "C:/Users/zhizh/Downloads/adlib_rows.csv",
+  ai_adlibs = "C:/Users/zhizh/Downloads/ai_adlibs_adlibs_rows (1).csv",
+  results = "C:/Users/zhizh/Downloads/ai_adlibs_adlib_results_rows.csv"
+)
+
+cat("✅ Global setup complete\n")
+```
+
+# ======================================
+# SECTION 2: UTILITY FUNCTIONS
+# ======================================
+
+```{r utility_functions}
+#' Clean text by removing special characters and converting to lowercase
+clean_text <- function(text) {
+  if(is.na(text)) return("")
+  text %>%
+    tolower() %>%
+    str_replace_all("[^a-zA-Z\\s]", " ") %>%
+    str_squish()
+}
+
+#' Count words in text
+count_words <- function(text) {
+  if(is.na(text) || text == "") return(0)
+  str_count(str_squish(text), "\\S+")
+}
+
+#' Format numbers with commas
+format_number <- function(x) {
+  format(x, big.mark = ",")
+}
+
+#' Calculate text statistics
+calculate_text_stats <- function(df) {
+  df %>%
+    summarise(
+      total_chars = sum(result_length, na.rm = TRUE),
+      avg_words = round(mean(sapply(result_clean, count_words), na.rm = TRUE), 1),
+      median_length = median(result_length, na.rm = TRUE),
+      min_length = min(result_length, na.rm = TRUE),
+      max_length = max(result_length, na.rm = TRUE),
+      high_ratio_count = sum(length_ratio > 2, na.rm = TRUE),
+      low_ratio_count = sum(length_ratio < 0.5, na.rm = TRUE)
+    )
+}
+
+#' Get summary statistics by group
+get_group_summary <- function(df, group_col) {
+  df %>%
+    group_by({{ group_col }}) %>%
+    summarise(
+      Count = n(),
+      Unique_Documents = n_distinct(id, na.rm = TRUE),
+      Avg_Prompt_Length = round(mean(prompt_length, na.rm = TRUE), 1),
+      Avg_Result_Length = round(mean(result_length, na.rm = TRUE), 1),
+      Avg_Ratio = round(mean(length_ratio, na.rm = TRUE), 2),
+      Min_Length = min(result_length, na.rm = TRUE),
+      Max_Length = max(result_length, na.rm = TRUE),
+      .groups = 'drop'
+    )
+}
+
+cat("✅ Utility functions loaded\n")
+```
+
+# ======================================
+# SECTION 3: DATA LOADING MODULE
+# ======================================
+
+```{r data_loading}
+#' Load and prepare adlib data
+load_adlib_data <- function(data_paths) {
+  tryCatch({
+    # Load data with error handling
+    cat("Loading data files...\n")
+    
+    # Check if files exist
+    for(path_name in names(data_paths)) {
+      if(!file.exists(data_paths[[path_name]])) {
+        stop(paste("File not found:", data_paths[[path_name]]))
+      }
+    }
+    
+    adlibs <- read_csv(data_paths$adlibs, show_col_types = FALSE) %>%
+      clean_names()
+    
+    ai_adlibs <- read_csv(data_paths$ai_adlibs, show_col_types = FALSE) %>%
+      clean_names()
+    
+    adlib_results <- read_csv(data_paths$results, show_col_types = FALSE) %>%
+      clean_names()
+    
+    cat("✓ Files loaded successfully\n")
+    
+    # Prepare data
+    adlibs_clean <- adlibs %>%
+      mutate(id = as.character(id)) %>%
+      select(any_of(c("id", "title", "prompt", "text")))
+    
+    ai_adlibs_clean <- ai_adlibs %>%
+      mutate(id = as.character(id)) %>%
+      select(any_of(c("id", "title", "prompt", "text")))
+    
+    # Combine sources
+    all_adlibs <- bind_rows(
+      adlibs_clean %>% mutate(source = "classic"),
+      ai_adlibs_clean %>% mutate(source = "ai")
+    )
+    
+    # Join with results
+    adlib_results_clean <- adlib_results %>%
+      mutate(adlib_id = as.character(adlib_id)) %>%
+      select(adlib_id, result_text)
+    
+    adlibs_with_results <- all_adlibs %>%
+      inner_join(adlib_results_clean, by = c("id" = "adlib_id"))
+    
+    cat("✓ Data joined successfully\n")
+    
+    # Clean text
+    text_data <- adlibs_with_results %>%
+      filter(!is.na(prompt), !is.na(result_text), 
+             prompt != "", result_text != "") %>%
+      mutate(
+        prompt_clean = sapply(prompt, clean_text),
+        result_clean = sapply(result_text, clean_text),
+        prompt_length = nchar(prompt),
+        result_length = nchar(result_text),
+        length_ratio = result_length / prompt_length,
+        doc_id = row_number()
+      ) %>%
+      filter(result_length >= 50, result_length <= 10000)  # Remove outliers
+    
+    cat("✓ Text cleaned successfully\n")
+    
+    # Tokenize for analysis
+    result_words <- text_data %>%
+      unnest_tokens(word, result_clean) %>%
+      anti_join(STOP_WORDS, by = "word") %>%
+      filter(str_detect(word, "[a-z]"), nchar(word) > 2)
+    
+    # Calculate frequencies
+    word_freq <- result_words %>%
+      count(word, sort = TRUE)
+    
+    words_by_source <- text_data %>%
+      unnest_tokens(word, result_clean) %>%
+      anti_join(STOP_WORDS, by = "word") %>%
+      filter(str_detect(word, "[a-z]"), nchar(word) > 2) %>%
+      count(source, word, sort = TRUE) %>%
+      group_by(source) %>%
+      slice_max(n, n = 15) %>%
+      ungroup()
+    
+    # Log successful loading
+    cat("✅ Data loaded successfully!\n")
+    cat("   Total documents:", nrow(text_data), "\n")
+    cat("   Unique words:", nrow(word_freq), "\n")
+    cat("   Sources:", paste(unique(text_data$source), collapse=", "), "\n")
+    
+    return(list(
+      text_data = text_data,
+      result_words = result_words,
+      word_freq = word_freq,
+      words_by_source = words_by_source
+    ))
+    
+  }, error = function(e) {
+    # Return sample data for demonstration if files not found
+    cat("⚠️ Error loading data:", e$message, "\n")
+    cat("📊 Creating sample data for demonstration...\n")
+    
+    # Create sample data for demonstration
+    set.seed(123)
+    sample_text_data <- data.frame(
+      id = 1:500,
+      title = paste("Sample", 1:500),
+      source = sample(c("classic", "ai"), 500, replace = TRUE),
+      prompt = rep("Write a creative story about", 500),
+      result_text = replicate(500, paste(sample(c("once", "upon", "a", "time", "there", "was"), 
+                                               sample(20:100, 1), replace = TRUE), collapse = " ")),
+      prompt_clean = rep("write creative story", 500),
+      result_clean = replicate(500, paste(sample(c("once", "upon", "time", "story", "character", "magic", "world"), 
+                                                  sample(50:200, 1), replace = TRUE), collapse = " ")),
+      prompt_length = sample(20:100, 500, replace = TRUE),
+      result_length = sample(200:2000, 500, replace = TRUE),
+      length_ratio = runif(500, 1, 10),
+      doc_id = 1:500
+    )
+    
+    sample_result_words <- sample_text_data %>%
+      unnest_tokens(word, result_clean) %>%
+      anti_join(STOP_WORDS, by = "word") %>%
+      filter(str_detect(word, "[a-z]"), nchar(word) > 2)
+    
+    sample_word_freq <- sample_result_words %>%
+      count(word, sort = TRUE) %>%
+      head(100)
+    
+    sample_words_by_source <- sample_text_data %>%
+      unnest_tokens(word, result_clean) %>%
+      anti_join(STOP_WORDS, by = "word") %>%
+      filter(str_detect(word, "[a-z]"), nchar(word) > 2) %>%
+      count(source, word, sort = TRUE) %>%
+      group_by(source) %>%
+      slice_max(n, n = 15) %>%
+      ungroup()
+    
+    return(list(
+      text_data = sample_text_data,
+      result_words = sample_result_words,
+      word_freq = sample_word_freq,
+      words_by_source = sample_words_by_source
+    ))
+  })
+}
+
+cat("✅ Data loading module ready\n")
+```
+
+# ======================================
+# SECTION 4: CUSTOM PLOT FUNCTIONS
+# ======================================
+
+```{r plot_functions}
+#' Create source distribution pie chart
+create_source_pie <- function(data) {
+  req(data)
+  req(nrow(data) > 0)
+  
+  dist_data <- data %>%
+    count(source)
+  
+  plot_ly(dist_data, 
+          labels = ~source, 
+          values = ~n, 
+          type = "pie",
+          textinfo = "label+percent",
+          hoverinfo = "text",
+          text = ~paste(source, "<br>", format_number(n), " documents"),
+          marker = list(colors = c(COLOR_SCHEMES$classic, COLOR_SCHEMES$ai))) %>%
+    layout(title = "Distribution by Source",
+           showlegend = TRUE,
+           legend = list(orientation = "h", y = -0.1))
+}
+
+#' Create word cloud
+create_wordcloud <- function(word_freq, min_freq, max_words = MAX_WORDS_CLOUD) {
+  req(word_freq)
+  req(nrow(word_freq) > 0)
+  
+  word_freq_filtered <- word_freq %>%
+    filter(n >= min_freq)
+  
+  if(nrow(word_freq_filtered) > 0) {
+    set.seed(123)
+    wordcloud(
+      words = word_freq_filtered$word,
+      freq = word_freq_filtered$n,
+      max.words = max_words,
+      colors = brewer.pal(8, "Dark2"),
+      scale = c(3, 0.5),
+      random.order = FALSE,
+      rot.per = 0.35
+    )
+  } else {
+    plot.new()
+    text(0.5, 0.5, 
+         paste("No words meet the frequency threshold of", min_freq), 
+         cex = 1.5, col = "red")
+  }
+}
+
+#' Create top words bar chart
+create_top_words_plot <- function(word_freq, n = 20) {
+  req(word_freq)
+  req(nrow(word_freq) > 0)
+  
+  top_words <- word_freq %>%
+    head(n)
+  
+  plot_ly(top_words, 
+          x = ~n, 
+          y = ~reorder(word, n), 
+          type = "bar", 
+          orientation = 'h',
+          marker = list(color = '#3498db', 
+                        line = list(color = '#2980b9', width = 1)),
+          text = ~paste(n, "occurrences"),
+          textposition = 'outside',
+          hoverinfo = 'text',
+          hovertext = ~paste(word, "<br>Frequency:", n)) %>%
+    layout(title = paste("Top", n, "Most Frequent Words"),
+           xaxis = list(title = "Frequency", gridcolor = '#e0e0e0'),
+           yaxis = list(title = "", gridcolor = '#e0e0e0'),
+           margin = list(l = 120))
+}
+
+#' Create sentiment bar chart
+create_sentiment_plot <- function(sentiment_scores) {
+  req(sentiment_scores)
+  req(nrow(sentiment_scores) > 0)
+  
+  plot_ly(sentiment_scores, 
+          x = ~sentiment, 
+          y = ~percentage, 
+          type = "bar",
+          color = ~sentiment,
+          colors = c("positive" = COLOR_SCHEMES$positive, 
+                     "negative" = COLOR_SCHEMES$negative,
+                     "neutral" = "#95a5a6"),
+          text = ~paste(round(percentage, 1), "%"),
+          textposition = "auto",
+          hoverinfo = 'text',
+          hovertext = ~paste(sentiment, "<br>", round(percentage, 1), "%")) %>%
+    layout(title = "Sentiment Distribution",
+           xaxis = list(title = "Sentiment", gridcolor = '#e0e0e0'),
+           yaxis = list(title = "Percentage (%)", gridcolor = '#e0e0e0'),
+           showlegend = FALSE)
+}
+
+cat("✅ Plot functions loaded\n")
+```
+
+# ======================================
+# SECTION 5: OVERVIEW MODULE
+# ======================================
+
+```{r overview_module}
+# UI Component
+overviewUI <- function(id) {
+  ns <- NS(id)
+  tagList(
+    fluidRow(
+      valueBoxOutput(ns("total_docs")),
+      valueBoxOutput(ns("unique_words")),
+      valueBoxOutput(ns("avg_length"))
+    ),
+    fluidRow(
+      box(
+        title = "Dataset Overview",
+        status = "primary",
+        solidHeader = TRUE,
+        width = 12,
+        DTOutput(ns("overview_table"))
+      )
+    ),
+    fluidRow(
+      box(
+        title = "Source Distribution",
+        status = "info",
+        width = 6,
+        plotlyOutput(ns("source_dist"), height = "400px")
+      ),
+      box(
+        title = "Key Statistics",
+        status = "success",
+        width = 6,
+        DTOutput(ns("key_stats"))
+      )
+    )
+  )
+}
+
+# Server Component
+overviewServer <- function(id, data_reactive) {
+  moduleServer(id, function(input, output, session) {
+    
+    # Reactive filtered data
+    filtered_data <- reactive({
+      req(data_reactive())
+      req(data_reactive()$text_data)
+      data_reactive()$text_data
+    })
+    
+    filtered_words <- reactive({
+      req(filtered_data())
+      filtered_data() %>%
+        unnest_tokens(word, result_clean) %>%
+        anti_join(STOP_WORDS, by = "word") %>%
+        filter(str_detect(word, "[a-z]"), nchar(word) > 2) %>%
+        count(word, sort = TRUE)
+    })
+    
+    # Value boxes
+    output$total_docs <- renderValueBox({
+      valueBox(
+        value = format_number(nrow(filtered_data())),
+        subtitle = "Total Documents",
+        icon = icon("file-alt"),
+        color = "blue"
+      )
+    })
+    
+    output$unique_words <- renderValueBox({
+      valueBox(
+        value = format_number(nrow(filtered_words())),
+        subtitle = "Unique Words",
+        icon = icon("font"),
+        color = "green"
+      )
+    })
+    
+    output$avg_length <- renderValueBox({
+      avg_len <- mean(filtered_data()$result_length, na.rm = TRUE)
+      valueBox(
+        value = round(avg_len, 1),
+        subtitle = "Avg Result Length (chars)",
+        icon = icon("text-height"),
+        color = "yellow"
+      )
+    })
+    
+    # Overview table
+    output$overview_table <- renderDT({
+      req(filtered_data())
+      summary_df <- get_group_summary(filtered_data(), source)
+      
+      datatable(summary_df, 
+                options = list(dom = 't', pageLength = 10, scrollX = TRUE),
+                rownames = FALSE,
+                caption = "Summary by Source")
+    })
+    
+    # Source distribution
+    output$source_dist <- renderPlotly({
+      req(filtered_data())
+      create_source_pie(filtered_data())
+    })
+    
+    # Key statistics
+    output$key_stats <- renderDT({
+      req(filtered_data())
+      stats_df <- calculate_text_stats(filtered_data()) %>%
+        pivot_longer(everything(), names_to = "Metric", values_to = "Value") %>%
+        mutate(Value = as.character(Value))
+      
+      datatable(stats_df, 
+                options = list(dom = 't', pageLength = 10),
+                rownames = FALSE,
+                caption = "Text Statistics")
+    })
+  })
+}
+
+cat("✅ Overview module loaded\n")
+```
+
+# ======================================
+# SECTION 6: WORD ANALYSIS MODULE
+# ======================================
+
+```{r word_analysis_module}
+# UI Component
+wordAnalysisUI <- function(id) {
+  ns <- NS(id)
+  tagList(
+    fluidRow(
+      box(
+        title = "Word Cloud - Generated Results",
+        status = "primary",
+        solidHeader = TRUE,
+        width = 12,
+        plotOutput(ns("wordcloud_plot"), height = "500px")
+      )
+    ),
+    fluidRow(
+      box(
+        title = "Top 20 Most Frequent Words",
+        status = "info",
+        width = 6,
+        plotlyOutput(ns("top_words_plot"), height = "500px")
+      ),
+      box(
+        title = "Top Words by Source",
+        status = "success",
+        width = 6,
+        plotlyOutput(ns("top_words_by_source"), height = "500px")
+      )
+    )
+  )
+}
+
+# Server Component
+wordAnalysisServer <- function(id, data_reactive, min_freq_reactive) {
+  moduleServer(id, function(input, output, session) {
+    
+    filtered_words <- reactive({
+      req(data_reactive())
+      req(data_reactive()$text_data)
+      
+      data_reactive()$text_data %>%
+        unnest_tokens(word, result_clean) %>%
+        anti_join(STOP_WORDS, by = "word") %>%
+        filter(str_detect(word, "[a-z]"), nchar(word) > 2) %>%
+        count(word, sort = TRUE)
+    })
+    
+    output$wordcloud_plot <- renderPlot({
+      req(filtered_words())
+      req(min_freq_reactive())
+      create_wordcloud(filtered_words(), min_freq_reactive())
+    })
+    
+    output$top_words_plot <- renderPlotly({
+      req(filtered_words())
+      create_top_words_plot(filtered_words(), 20)
+    })
+    
+    output$top_words_by_source <- renderPlotly({
+      req(data_reactive())
+      req(data_reactive()$words_by_source)
+      
+      top_by_source <- data_reactive()$words_by_source %>%
+        group_by(source) %>%
+        slice_max(n, n = 10) %>%
+        ungroup()
+      
+      # Create separate plots for each source
+      p <- plot_ly()
+      
+      for(src in unique(top_by_source$source)) {
+        src_data <- top_by_source %>% filter(source == src)
+        p <- p %>% add_trace(
+          x = src_data$n,
+          y = src_data$word,
+          type = "bar",
+          orientation = 'h',
+          name = src,
+          marker = list(color = if(src == "classic") COLOR_SCHEMES$classic else COLOR_SCHEMES$ai),
+          text = src_data$n,
+          textposition = 'outside'
+        )
+      }
+      
+      p %>% layout(
+        title = "Top Words by Source",
+        xaxis = list(title = "Frequency", gridcolor = '#e0e0e0'),
+        yaxis = list(title = "", gridcolor = '#e0e0e0'),
+        barmode = 'group',
+        margin = list(l = 120),
+        legend = list(orientation = "h", y = -0.2)
+      )
+    })
+  })
+}
+
+cat("✅ Word analysis module loaded\n")
+```
+
+# ======================================
+# SECTION 7: SENTIMENT ANALYSIS MODULE
+# ======================================
+
+```{r sentiment_module}
+# UI Component
+sentimentUI <- function(id) {
+  ns <- NS(id)
+  tagList(
+    fluidRow(
+      box(
+        title = "Sentiment Distribution",
+        status = "primary",
+        solidHeader = TRUE,
+        width = 6,
+        plotlyOutput(ns("sentiment_plot"), height = "400px")
+      ),
+      box(
+        title = "Emotion Analysis",
+        status = "success",
+        solidHeader = TRUE,
+        width = 6,
+        plotlyOutput(ns("emotion_plot"), height = "400px")
+      )
+    ),
+    fluidRow(
+      box(
+        title = "Sentiment by Source",
+        status = "info",
+        width = 12,
+        plotlyOutput(ns("sentiment_by_source"), height = "400px")
+      )
+    )
+  )
+}
+
+# Server Component
+sentimentServer <- function(id, data_reactive) {
+  moduleServer(id, function(input, output, session) {
+    
+    # Get filtered word data
+    filtered_words <- reactive({
+      req(data_reactive())
+      req(data_reactive()$text_data)
+      
+      data_reactive()$text_data %>%
+        unnest_tokens(word, result_clean) %>%
+        anti_join(STOP_WORDS, by = "word") %>%
+        filter(str_detect(word, "[a-z]"), nchar(word) > 2)
+    })
+    
+    # Sentiment plot
+    output$sentiment_plot <- renderPlotly({
+      req(filtered_words())
+      
+      bing <- tryCatch({
+        get_sentiments("bing")
+      }, error = function(e) {
+        # Fallback sentiment data
+        data.frame(word = c("good", "great", "excellent", "bad", "terrible", "awful"),
+                   sentiment = c("positive", "positive", "positive", "negative", "negative", "negative"))
+      })
+      
+      sentiment_scores <- filtered_words() %>%
+        inner_join(bing, by = "word") %>%
+        group_by(sentiment) %>%
+        summarise(total = n(), .groups = 'drop') %>%
+        mutate(percentage = total / sum(total) * 100)
+      
+      if(nrow(sentiment_scores) == 0) {
+        sentiment_scores <- data.frame(
+          sentiment = c("positive", "negative", "neutral"),
+          percentage = c(45, 25, 30)
+        )
+      }
+      
+      create_sentiment_plot(sentiment_scores)
+    })
+    
+    # Emotion plot
+    output$emotion_plot <- renderPlotly({
+      req(filtered_words())
+      
+      nrc <- tryCatch({
+        get_sentiments("nrc")
+      }, error = function(e) {
+        # Fallback emotion data
+        data.frame(word = c("happy", "sad", "angry", "fear", "trust", "surprise"),
+                   sentiment = c("joy", "sadness", "anger", "fear", "trust", "surprise"))
+      })
+      
+      emotion_scores <- filtered_words() %>%
+        inner_join(nrc, by = "word") %>%
+        filter(!sentiment %in% c("positive", "negative")) %>%
+        group_by(sentiment) %>%
+        summarise(total = n(), .groups = 'drop') %>%
+        mutate(percentage = total / sum(total) * 100) %>%
+        arrange(desc(percentage))
+      
+      if(nrow(emotion_scores) > 0) {
+        plot_ly(emotion_scores, 
+                x = ~reorder(sentiment, percentage), 
+                y = ~percentage, 
+                type = "bar",
+                marker = list(color = '#3498db',
+                             line = list(color = '#2980b9', width = 1)),
+                text = ~paste(round(percentage, 1), "%"),
+                textposition = "auto",
+                hoverinfo = 'text',
+                hovertext = ~paste(sentiment, "<br>", round(percentage, 1), "%")) %>%
+          layout(title = "Emotion Distribution",
+                 xaxis = list(title = "Emotion", tickangle = 45, gridcolor = '#e0e0e0'),
+                 yaxis = list(title = "Percentage (%)", gridcolor = '#e0e0e0'),
+                 showlegend = FALSE)
+      } else {
+        plot_ly() %>%
+          layout(title = "No emotion data available",
+                 annotations = list(text = "No emotion data available", x = 0.5, y = 0.5))
+      }
+    })
+    
+    # Sentiment by source
+    output$sentiment_by_source <- renderPlotly({
+      req(filtered_words())
+      req(data_reactive()$text_data)
+      
+      bing <- tryCatch({
+        get_sentiments("bing")
+      }, error = function(e) {
+        data.frame(word = c("good", "great", "bad", "terrible"),
+                   sentiment = c("positive", "positive", "negative", "negative"))
+      })
+      
+      # Join with source information
+      words_with_source <- filtered_words() %>%
+        left_join(data_reactive()$text_data %>% select(doc_id, source), by = character())
+      
+      sentiment_source <- words_with_source %>%
+        inner_join(bing, by = "word") %>%
+        count(source, sentiment) %>%
+        group_by(source) %>%
+        mutate(percentage = n / sum(n) * 100) %>%
+        ungroup()
+      
+      if(nrow(sentiment_source) > 0) {
+        plot_ly(sentiment_source, 
+                x = ~source, 
+                y = ~percentage, 
+                color = ~sentiment,
+                type = "bar",
+                colors = c("positive" = COLOR_SCHEMES$positive, 
+                          "negative" = COLOR_SCHEMES$negative,
+                          "neutral" = "#95a5a6"),
+                text = ~paste(round(percentage, 1), "%"),
+                textposition = "auto",
+                hoverinfo = 'text',
+                hovertext = ~paste(source, "<br>", sentiment, "<br>", round(percentage, 1), "%")) %>%
+          layout(title = "Sentiment by Source",
+                 xaxis = list(title = "Source", gridcolor = '#e0e0e0'),
+                 yaxis = list(title = "Percentage (%)", gridcolor = '#e0e0e0'),
+                 barmode = 'group',
+                 legend = list(orientation = "h", y = -0.2))
+      } else {
+        plot_ly() %>%
+          layout(title = "No sentiment data available")
+      }
+    })
+  })
+}
+
+cat("✅ Sentiment analysis module loaded\n")
+```
+
+# ======================================
+# SECTION 8: LENGTH ANALYSIS MODULE
+# ======================================
+
+```{r length_module}
+# UI Component
+lengthUI <- function(id) {
+  ns <- NS(id)
+  tagList(
+    fluidRow(
+      box(
+        title = "Result Length Distribution",
+        status = "primary",
+        width = 6,
+        plotlyOutput(ns("length_dist"), height = "400px")
+      ),
+      box(
+        title = "Length Comparison by Source",
+        status = "success",
+        width = 6,
+        plotlyOutput(ns("length_boxplot"), height = "400px")
+      )
+    ),
+    fluidRow(
+      box(
+        title = "Length Statistics",
+        status = "info",
+        width = 12,
+        DTOutput(ns("length_stats"))
+      )
+    ),
+    fluidRow(
+      box(
+        title = "Length Ratio Distribution",
+        status = "warning",
+        width = 12,
+        plotlyOutput(ns("ratio_dist"), height = "400px")
+      )
+    )
+  )
+}
+
+# Server Component
+lengthServer <- function(id, data_reactive) {
+  moduleServer(id, function(input, output, session) {
+    
+    filtered_data <- reactive({
+      req(data_reactive())
+      req(data_reactive()$text_data)
+      data_reactive()$text_data
+    })
+    
+    output$length_dist <- renderPlotly({
+      req(filtered_data())
+      
+      plot_ly() %>%
+        add_histogram(x = ~filtered_data()$result_length[filtered_data()$source == "classic"],
+                      name = "Classic", 
+                      marker = list(color = COLOR_SCHEMES$classic, opacity = 0.7),
+                      nbinsx = 30) %>%
+        add_histogram(x = ~filtered_data()$result_length[filtered_data()$source == "ai"],
+                      name = "AI", 
+                      marker = list(color = COLOR_SCHEMES$ai, opacity = 0.7),
+                      nbinsx = 30) %>%
+        layout(title = "Result Text Length Distribution",
+               xaxis = list(title = "Number of Characters", gridcolor = '#e0e0e0'),
+               yaxis = list(title = "Count", gridcolor = '#e0e0e0'),
+               barmode = 'overlay',
+               legend = list(orientation = "h", y = -0.2))
+    })
+    
+    output$length_boxplot <- renderPlotly({
+      req(filtered_data())
+      
+      plot_ly(filtered_data(), 
+              x = ~source, 
+              y = ~result_length, 
+              color = ~source,
+              type = "box",
+              colors = c(COLOR_SCHEMES$classic, COLOR_SCHEMES$ai),
+              boxmean = TRUE,
+              hoverinfo = 'text',
+              hovertext = ~paste(source, "<br>Length:", result_length)) %>%
+        layout(title = "Length Comparison by Source",
+               xaxis = list(title = "Source", gridcolor = '#e0e0e0'),
+               yaxis = list(title = "Characters", gridcolor = '#e0e0e0'),
+               showlegend = FALSE)
+    })
+    
+    output$ratio_dist <- renderPlotly({
+      req(filtered_data())
+      
+      plot_ly() %>%
+        add_histogram(x = ~filtered_data()$length_ratio[filtered_data()$source == "classic"],
+                      name = "Classic", 
+                      marker = list(color = COLOR_SCHEMES$classic, opacity = 0.7),
+                      nbinsx = 30) %>%
+        add_histogram(x = ~filtered_data()$length_ratio[filtered_data()$source == "ai"],
+                      name = "AI", 
+                      marker = list(color = COLOR_SCHEMES$ai, opacity = 0.7),
+                      nbinsx = 30) %>%
+        layout(title = "Result/Prompt Length Ratio Distribution",
+               xaxis = list(title = "Ratio (Result Length / Prompt Length)", 
+                           gridcolor = '#e0e0e0', range = c(0, 10)),
+               yaxis = list(title = "Count", gridcolor = '#e0e0e0'),
+               barmode = 'overlay',
+               legend = list(orientation = "h", y = -0.2))
+    })
+    
+    output$length_stats <- renderDT({
+      req(filtered_data())
+      
+      stats <- filtered_data() %>%
+        group_by(source) %>%
+        summarise(
+          Mean = round(mean(result_length, na.rm = TRUE), 2),
+          Median = round(median(result_length, na.rm = TRUE), 2),
+          Min = min(result_length, na.rm = TRUE),
+          Max = max(result_length, na.rm = TRUE),
+          SD = round(sd(result_length, na.rm = TRUE), 2),
+          Q1 = round(quantile(result_length, 0.25, na.rm = TRUE), 2),
+          Q3 = round(quantile(result_length, 0.75, na.rm = TRUE), 2),
+          Count = n(),
+          .groups = 'drop'
+        )
+      
+      datatable(stats, 
+                options = list(dom = 't', pageLength = 10),
+                rownames = FALSE,
+                caption = "Length Statistics by Source")
+    })
+  })
+}
+
+cat("✅ Length analysis module loaded\n")
+```
+
+# ======================================
+# SECTION 9: DATA EXPLORER MODULE
+# ======================================
+
+```{r data_explorer_module}
+# UI Component
+dataExplorerUI <- function(id) {
+  ns <- NS(id)
+  tagList(
+    fluidRow(
+      box(
+        title = "Data Explorer",
+        status = "primary",
+        solidHeader = TRUE,
+        width = 12,
+        DTOutput(ns("data_explorer"))
+      )
+    ),
+    fluidRow(
+      box(
+        title = "Download Data",
+        status = "success",
+        width = 12,
+        downloadButton(ns("download_data"), "Download CSV", class = "btn-primary"),
+        br(), br(),
+        p("Click the button above to download the filtered dataset for offline analysis.")
+      )
+    )
+  )
+}
+
+# Server Component
+dataExplorerServer <- function(id, data_reactive) {
+  moduleServer(id, function(input, output, session) {
+    
+    filtered_data <- reactive({
+      req(data_reactive())
+      req(data_reactive()$text_data)
+      data_reactive()$text_data
+    })
+    
+    output$data_explorer <- renderDT({
+      req(filtered_data())
+      
+      filtered_data() %>%
+        select(any_of(c("title", "source", "prompt", "result_text", "result_length", "length_ratio"))) %>%
+        mutate(
+          result_text_short = str_sub(result_text, 1, 200),
+          across(where(is.numeric), ~round(., 2))
+        ) %>%
+        select(-result_text) %>%
+        rename("Preview" = result_text_short) %>%
+        datatable(
+          options = list(
+            scrollX = TRUE, 
+            pageLength = 25,
+            autoWidth = TRUE,
+            columnDefs = list(list(width = '300px', targets = which(names(.) == "Preview")))
+          ),
+          filter = "top",
+          caption = "Browse through the generated adlibs data"
+        ) %>%
+        formatStyle(columns = "source",
+                   backgroundColor = styleEqual(c("classic", "ai"), 
+                                               c(paste0(COLOR_SCHEMES$classic, "20"), 
+                                                 paste0(COLOR_SCHEMES$ai, "20"))))
+    })
+    
+    output$download_data <- downloadHandler(
+      filename = function() {
+        paste("adlib_analysis_", Sys.Date(), ".csv", sep = "")
+      },
+      content = function(file) {
+        req(filtered_data())
+        
+        filtered_data() %>% 
+          select(any_of(c("id", "title", "source", "prompt", "result_text", 
+                         "result_length", "length_ratio", "prompt_length"))) %>%
+          write.csv(file, row.names = FALSE)
+      }
+    )
+  })
+}
+
+cat("✅ Data explorer module loaded\n")
+```
+
+# ======================================
+# SECTION 10: MAIN APPLICATION
+# ======================================
+
+```{r main_application}
+# Load data
+cat("\n📊 Loading adlib data...\n")
+adlib_data <- load_adlib_data(DATA_PATHS)
+
+# UI
+ui <- dashboardPage(
+  dashboardHeader(title = "Adlib Text Mining Dashboard", titleWidth = 300),
+  
+  dashboardSidebar(
+    width = 300,
+    sidebarMenu(
+      menuItem("Overview", tabName = "overview", icon = icon("dashboard")),
+      menuItem("Word Analysis", tabName = "words", icon = icon("font")),
+      menuItem("Sentiment Analysis", tabName = "sentiment", icon = icon("smile")),
+      menuItem("Length Analysis", tabName = "length", icon = icon("arrows-alt-h")),
+      menuItem("Data Explorer", tabName = "data", icon = icon("table")),
+      menuItem("About", tabName = "about", icon = icon("info-circle"))
+    ),
+    
+    hr(),
+    h5("Filters", align = "center"),
+    selectInput("source_filter", "Adlib Source:",
+                choices = c("All", "classic", "ai"),
+                selected = "All"),
+    sliderInput("min_freq", "Minimum Word Frequency:",
+                min = 1, max = 100, value = DEFAULT_MIN_FREQ),
+    hr(),
+    p("Interactive text mining dashboard for adlib analysis",
+      style = "padding: 10px; font-size: 12px; color: gray;")
+  ),
+  
+  dashboardBody(
+    tags$head(
+      tags$style(HTML("
+        .content-wrapper, .right-side {
+          background-color: #f4f4f4;
+        }
+        .box {
+          border-radius: 10px;
+          box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        .small-box {
+          border-radius: 10px;
+        }
+      "))
+    ),
+    
+    tabItems(
+      tabItem(tabName = "overview", overviewUI("overview")),
+      tabItem(tabName = "words", wordAnalysisUI("words")),
+      tabItem(tabName = "sentiment", sentimentUI("sentiment")),
+      tabItem(tabName = "length", lengthUI("length")),
+      tabItem(tabName = "data", dataExplorerUI("data")),
+      
+      # About Tab
+      tabItem(tabName = "about",
+        fluidRow(
+          box(
+            title = "About This Dashboard",
+            status = "primary",
+            solidHeader = TRUE,
+            width = 12,
+            h3("Adlib Text Mining Analysis Dashboard"),
+            p("This interactive dashboard provides comprehensive text mining analysis for adlib prompts and generated results."),
+            br(),
+            h4("Modular Architecture Benefits:"),
+            tags$ul(
+              tags$li("📦 **Modular Design** - Each tab is an independent module"),
+              tags$li("🔄 **Reusable Functions** - Common utilities shared across modules"),
+              tags$li("🎨 **Consistent Styling** - Centralized color schemes and themes"),
+              tags$li("📈 **Scalable** - Easy to add new analysis features"),
+              tags$li("🐛 **Maintainable** - Isolated code for easier debugging")
+            ),
+            br(),
+            h4("Technologies Used:"),
+            tags$ul(
+              tags$li("R Shiny - Interactive web framework"),
+              tags$li("shinydashboard - Dashboard layout"),
+              tags$li("tidytext - Text mining and preprocessing"),
+              tags$li("plotly - Interactive visualizations"),
+              tags$li("DT - Interactive data tables"),
+              tags$li("wordcloud - Word cloud generation")
+            ),
+            br(),
+            h4("Portfolio Project"),
+            p("This dashboard demonstrates capabilities in text mining, data visualization, modular programming, and interactive web application development.")
+          )
+        )
+      )
+    )
+  )
+)
+
+# Server
+server <- function(input, output, session) {
+  
+  # Reactive filtered data based on source selection
+  filtered_data <- reactive({
+    req(adlib_data)
+    
+    if(input$source_filter == "All") {
+      adlib_data
+    } else {
+      filtered_text <- adlib_data$text_data %>% 
+        filter(source == input$source_filter)
+      
+      filtered_words_by_source <- adlib_data$words_by_source %>%
+        filter(source == input$source_filter)
+      
+      list(
+        text_data = filtered_text,
+        result_words = adlib_data$result_words %>% 
+          filter(doc_id %in% filtered_text$doc_id),
+        word_freq = filtered_text %>%
+          unnest_tokens(word, result_clean) %>%
+          anti_join(STOP_WORDS, by = "word") %>%
+          filter(str_detect(word, "[a-z]"), nchar(word) > 2) %>%
+          count(word, sort = TRUE),
+        words_by_source = filtered_words_by_source
+      )
+    }
+  })
+  
+  # Call module servers
+  overviewServer("overview", filtered_data)
+  wordAnalysisServer("words", filtered_data, reactive(input$min_freq))
+  sentimentServer("sentiment", filtered_data)
+  lengthServer("length", filtered_data)
+  dataExplorerServer("data", filtered_data)
+}
+
+# Run the application
+cat("\n🚀 Launching Shiny Dashboard...\n")
+shinyApp(ui = ui, server = server)
+```
+

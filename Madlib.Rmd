@@ -1,0 +1,916 @@
+---
+title: "R Notebook"
+output:
+  html_document:
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+# Load all required libraries
+library(tidyverse)
+library(janitor)
+library(gridExtra)
+library(skimr)
+library(tidytext)
+library(plotly)
+library(DT)
+library(highcharter)       # corrected from 'highcharter'
+library(wordcloud2)
+library(corrr)
+library(igraph)
+library(ggraph)
+library(widyr)
+library(networkD3)
+library(textdata)
+library(corrplot)
+library(irlba)             # for sparse PCA
+library(topicmodels)       # for LDA
+
+# Set seed for reproducibility
+set.seed(123)
+
+# Load and clean data function
+load_and_clean_data <- function(data_dir) {
+  files <- list(
+    adlib_tones    = "ai_adlibs_adlib_tones_rows.csv",
+    adlib_categories = "adlib_categories_category_rows.csv",
+    adlibs         = "adlib_rows.csv",
+    adlib_results  = "ai_adlibs_adlib_results_rows.csv",
+    ai_adlibs      = "ai_adlibs_adlibs_rows (1).csv",
+    ai_adlib_cats  = "ai_adlibs_adlib_categories_rows.csv",
+    categories     = "category_rows.csv",
+    feature_toggles = "ai_adlibs_feature_toggles_rows.csv",
+    ai_categories  = "ai_adlibs_categories_rows.csv"
+  )
+  
+  data_list <- list()
+  for(name in names(files)) {
+    data_list[[name]] <- read_csv(paste0(data_dir, files[[name]]), 
+                                  show_col_types = FALSE) %>% clean_names()
+  }
+  return(data_list)
+}
+
+# EDA function
+basic_eda <- function(df, name) {
+  cat("\n", strrep("=", 80), "\n")
+  cat("EDA FOR:", name, "\n")
+  cat(strrep("=", 80), "\n\n")
+  
+  cat("Dimensions:", nrow(df), "rows x", ncol(df), "columns\n\n")
+  
+  col_info <- data.frame(
+    Column = names(df),
+    Type = sapply(df, function(x) class(x)[1]),
+    Missing = sapply(df, function(x) sum(is.na(x))),
+    Unique = sapply(df, function(x) length(unique(x)))
+  )
+  print(col_info)
+  cat("\nFirst 5 rows:\n")
+  print(head(df, 5))
+  cat("\n")
+  
+  numeric_cols <- names(df)[sapply(df, is.numeric)]
+  if(length(numeric_cols) > 0) {
+    cat("Numeric Columns Summary:\n")
+    for(col in numeric_cols) {
+      cat(sprintf("  %s: Min=%.2f, Max=%.2f, Mean=%.2f, Median=%.2f\n", 
+                  col, min(df[[col]], na.rm = TRUE), max(df[[col]], na.rm = TRUE),
+                  mean(df[[col]], na.rm = TRUE), median(df[[col]], na.rm = TRUE)))
+    }
+    cat("\n")
+  }
+}
+
+# Text cleaning function
+clean_text <- function(text) {
+  text %>%
+    tolower() %>%
+    str_replace_all("[^a-zA-Z\\s]", " ") %>%
+    str_squish()
+}
+
+# Tokenize text function
+tokenize_words <- function(df, text_column, id_column = "id") {
+  df %>%
+    unnest_tokens(word, {{ text_column }}) %>%
+    anti_join(stop_words, by = "word") %>%
+    filter(str_detect(word, "[a-z]"), nchar(word) > 2)
+}
+```
+
+```{r}
+# Load data
+data_dir <- "C:/Users/zhizh/Downloads/"
+data_list <- load_and_clean_data(data_dir)
+
+# Assign individual data frames
+list2env(data_list, envir = .GlobalEnv)
+
+# Run EDA for all datasets
+for(name in names(data_list)) {
+  basic_eda(data_list[[name]], name)
+}
+```
+
+```{r}
+# Prepare AI adlibs data (only AI adlibs have results)
+ai_adlibs_clean <- ai_adlibs %>%
+  mutate(id = as.character(id)) %>%
+  select(id, title, prompt, text, temperature)
+
+adlib_results_clean <- adlib_results %>%
+  mutate(adlib_id = as.character(adlib_id)) %>%
+  select(adlib_id, result_text)
+
+# Create main text dataset
+text_data <- ai_adlibs_clean %>%
+  inner_join(adlib_results_clean, by = c("id" = "adlib_id")) %>%
+  filter(!is.na(prompt), !is.na(result_text), prompt != "", result_text != "") %>%
+  mutate(
+    prompt_clean = clean_text(prompt),
+    result_clean = clean_text(result_text),
+    prompt_length = nchar(prompt),
+    result_length = nchar(result_text),
+    length_ratio = result_length / prompt_length
+  ) %>%
+  filter(result_length >= 50, result_length <= 10000)
+
+cat("Valid prompt-result pairs:", nrow(text_data), "\n")
+
+# Tokenize
+prompt_words <- tokenize_words(text_data, prompt_clean)
+result_words <- tokenize_words(text_data, result_clean)
+
+# Word frequencies
+prompt_word_freq <- prompt_words %>% count(word, sort = TRUE) %>% mutate(source = "prompt")
+result_word_freq <- result_words %>% count(word, sort = TRUE) %>% mutate(source = "result")
+all_word_freq <- bind_rows(prompt_word_freq, result_word_freq)
+
+# Common words analysis
+common_words <- inner_join(
+  prompt_word_freq %>% rename(prompt_freq = n),
+  result_word_freq %>% rename(result_freq = n),
+  by = "word"
+) %>%
+  mutate(total_freq = prompt_freq + result_freq, ratio = result_freq / prompt_freq)
+
+# Unique words
+prompt_only <- anti_join(prompt_word_freq, result_word_freq, by = "word") %>% arrange(desc(n))
+result_only <- anti_join(result_word_freq, prompt_word_freq, by = "word") %>% arrange(desc(n))
+```
+
+```{r}
+# Static word clouds
+par(mfrow = c(1, 2), mar = c(1, 1, 4, 1))
+
+wordcloud::wordcloud(words = prompt_word_freq$word[1:100], freq = prompt_word_freq$n[1:100],
+                     max.words = 100, colors = RColorBrewer::brewer.pal(8, "Blues"), scale = c(3, 0.5))
+title("Prompts Word Cloud", line = 2, cex.main = 1.3)
+
+wordcloud::wordcloud(words = result_word_freq$word[1:100], freq = result_word_freq$n[1:100],
+                     max.words = 100, colors = RColorBrewer::brewer.pal(8, "Greens"), scale = c(3, 0.5))
+title("Results Word Cloud", line = 2, cex.main = 1.3)
+
+# Interactive word clouds
+prompt_colors <- rep(c("#3498db", "#2980b9", "#5dade2"), length.out = 100)
+result_colors <- rep(c("#2ecc71", "#27ae60", "#58d68d"), length.out = 100)
+
+wordcloud2(prompt_word_freq[1:100,], size = 0.8, shape = 'circle', color = prompt_colors, backgroundColor = '#f8f9fa')
+wordcloud2(result_word_freq[1:100,], size = 0.8, shape = 'circle', color = result_colors, backgroundColor = '#f8f9fa')
+```
+
+```{r}
+# Top 15 words comparison
+create_top_words_plot <- function(word_freq, title, color) {
+  word_freq %>%
+    slice_head(n = 15) %>%
+    plot_ly(x = ~n, y = ~reorder(word, n), type = "bar", orientation = 'h',
+            marker = list(color = color), text = ~paste("Word:", word, "<br>Frequency:", n),
+            hoverinfo = "text") %>%
+    layout(title = title, xaxis = list(title = "Frequency"), yaxis = list(title = ""))
+}
+
+p_prompt <- create_top_words_plot(prompt_word_freq, "Top 15 Words in Prompts", '#3498db')
+p_result <- create_top_words_plot(result_word_freq, "Top 15 Words in Results", '#2ecc71')
+subplot(p_prompt, p_result, nrows = 1, titleX = TRUE, titleY = TRUE)
+
+# Word overlap analysis
+common_words %>%
+  head(20) %>%
+  plot_ly() %>%
+  add_segments(x = ~prompt_freq, xend = 0, y = ~reorder(word, total_freq), yend = ~reorder(word, total_freq),
+               color = I("#3498db"), showlegend = FALSE) %>%
+  add_markers(x = ~prompt_freq, y = ~reorder(word, total_freq), color = I("#3498db"), name = "Prompts") %>%
+  add_segments(x = ~-result_freq, xend = 0, y = ~reorder(word, total_freq), yend = ~reorder(word, total_freq),
+               color = I("#2ecc71"), showlegend = FALSE) %>%
+  add_markers(x = ~-result_freq, y = ~reorder(word, total_freq), color = I("#2ecc71"), name = "Results") %>%
+  layout(title = "Common Words: Prompts (Blue) vs Results (Green)",
+         xaxis = list(title = "Frequency"), yaxis = list(title = ""))
+```
+
+```{r}
+# Unique words visualization
+unique_words <- bind_rows(
+  prompt_only %>% head(20) %>% mutate(type = "Unique to Prompts", frequency = n),
+  result_only %>% head(20) %>% mutate(type = "Unique to Results", frequency = n)
+)
+
+ggplot(unique_words, aes(x = reorder(word, frequency), y = frequency, fill = type)) +
+  geom_col() + facet_wrap(~type, scales = "free") + coord_flip() +
+  labs(title = "Unique Vocabulary: Prompts vs Results", x = "Words", y = "Frequency") +
+  theme_minimal() + scale_fill_manual(values = c("#3498db", "#2ecc71")) +
+  theme(legend.position = "none")
+```
+
+```{r}
+# Length distribution plots
+length_plots <- list(
+  plot_ly(x = text_data$prompt_length, type = "histogram", nbinsx = 40,
+          marker = list(color = "#3498db"), name = "Prompts") %>%
+    layout(title = "Prompt Length Distribution", xaxis = list(title = "Length"), yaxis = list(title = "Count")),
+  plot_ly(x = text_data$result_length, type = "histogram", nbinsx = 40,
+          marker = list(color = "#2ecc71"), name = "Results") %>%
+    layout(title = "Result Length Distribution", xaxis = list(title = "Length"), yaxis = list(title = "Count")),
+  plot_ly(x = text_data$length_ratio, type = "histogram", nbinsx = 40,
+          marker = list(color = "#e74c3c"), name = "Ratio") %>%
+    layout(title = "Result/Prompt Length Ratio", xaxis = list(title = "Ratio", type = "log"), yaxis = list(title = "Count"))
+)
+
+subplot(length_plots, nrows = 2, titleX = TRUE, titleY = TRUE)
+
+# Summary statistics
+length_stats <- text_data %>%
+  summarise(
+    Avg_Prompt_Length = mean(prompt_length), Avg_Result_Length = mean(result_length),
+    Median_Result_Length = median(result_length), Avg_Length_Ratio = mean(length_ratio),
+    Median_Ratio = median(length_ratio)
+  )
+print(length_stats)
+```
+
+```{r}
+# Bigram analysis function
+get_bigrams <- function(df, text_column, source_name) {
+  df %>%
+    unnest_tokens(bigram, {{ text_column }}, token = "ngrams", n = 2) %>%
+    separate(bigram, c("word1", "word2"), sep = " ") %>%
+    filter(!word1 %in% stop_words$word, !word2 %in% stop_words$word, !is.na(word1), !is.na(word2)) %>%
+    count(word1, word2, sort = TRUE) %>%
+    unite(bigram, word1, word2, sep = " ") %>%
+    head(15) %>%
+    mutate(source = source_name)
+}
+
+prompt_bigrams <- get_bigrams(text_data, prompt_clean, "Prompts")
+result_bigrams <- get_bigrams(text_data, result_clean, "Results")
+all_bigrams <- bind_rows(prompt_bigrams, result_bigrams)
+
+ggplot(all_bigrams, aes(x = reorder(bigram, n), y = n, fill = source)) +
+  geom_col() + facet_wrap(~source, scales = "free") + coord_flip() +
+  labs(title = "Most Common Word Pairs (Bigrams)", x = "Bigram", y = "Frequency") +
+  theme_minimal() + scale_fill_manual(values = c("#3498db", "#2ecc71")) +
+  theme(legend.position = "none")
+```
+
+```{r}
+# Sentiment analysis function
+get_sentiment <- function(word_df, lexicon, source_name) {
+  word_df %>%
+    inner_join(get_sentiments(lexicon), by = "word") %>%
+    count(sentiment) %>%
+    mutate(source = source_name, percentage = n/sum(n)*100)
+}
+
+# Bing sentiment
+prompt_sentiment <- get_sentiment(prompt_words, "bing", "Prompts")
+result_sentiment <- get_sentiment(result_words, "bing", "Results")
+sentiment_combined <- bind_rows(prompt_sentiment, result_sentiment)
+
+# Interactive sentiment plot
+plot_ly(sentiment_combined, x = ~sentiment, y = ~percentage, color = ~source,
+        type = "bar", colors = c("#3498db", "#2ecc71"),
+        text = ~paste("Sentiment:", sentiment, "<br>Percentage:", round(percentage, 2), "%"),
+        hoverinfo = "text") %>%
+  layout(title = "Sentiment Analysis: Prompts vs Results",
+         xaxis = list(title = "Sentiment", tickangle = 45),
+         yaxis = list(title = "Percentage (%)"), barmode = "group")
+
+# NRC emotions
+nrc_sentiment <- bind_rows(
+  get_sentiment(prompt_words, "nrc", "Prompts") %>% filter(!sentiment %in% c("positive", "negative")),
+  get_sentiment(result_words, "nrc", "Results") %>% filter(!sentiment %in% c("positive", "negative"))
+)
+
+ggplot(nrc_sentiment, aes(x = reorder(sentiment, percentage), y = percentage, fill = source)) +
+  geom_bar(stat = "identity", position = "dodge") + coord_flip() +
+  labs(title = "Emotion Analysis: Prompts vs Results", x = "Emotion", y = "Percentage (%)") +
+  theme_minimal() + scale_fill_manual(values = c("#3498db", "#2ecc71"))
+```
+
+```{r}
+# TF-IDF analysis
+all_words <- bind_rows(
+  prompt_words %>% mutate(source = "prompt"),
+  result_words %>% mutate(source = "result")
+)
+
+tf_idf_analysis <- all_words %>%
+  count(source, word, sort = TRUE) %>%
+  bind_tf_idf(word, source, n)
+
+# Top distinctive words
+distinctive_words <- tf_idf_analysis %>%
+  group_by(source) %>%
+  slice_max(tf_idf, n = 10) %>%
+  ungroup()
+
+ggplot(distinctive_words, aes(x = reorder_within(word, tf_idf, source), y = tf_idf, fill = source)) +
+  geom_col() + facet_wrap(~source, scales = "free") + coord_flip() +
+  scale_x_reordered() +
+  labs(title = "Most Distinctive Words by Source (TF-IDF)", x = "Words", y = "TF-IDF Score") +
+  theme_minimal() + scale_fill_manual(values = c("prompt" = "#3498db", "result" = "#2ecc71")) +
+  theme(legend.position = "none")
+
+# TF-IDF heatmap
+top_tfidf_words <- tf_idf_analysis %>%
+  group_by(source) %>% slice_max(tf_idf, n = 15) %>% ungroup() %>%
+  select(word, source, tf_idf) %>% pivot_wider(names_from = source, values_from = tf_idf, values_fill = 0)
+
+plot_ly(x = colnames(top_tfidf_words)[-1], y = top_tfidf_words$word,
+        z = as.matrix(top_tfidf_words[, -1]), type = "heatmap",
+        colorscale = list(c(0, "#f7fbff"), c(1, "#3498db"))) %>%
+  layout(title = "TF-IDF Heatmap: Distinctive Words by Source",
+         xaxis = list(title = "Source"), yaxis = list(title = "Words"), margin = list(l = 120))
+```
+
+```{r}
+# Comprehensive word statistics table
+word_stats <- bind_rows(
+  prompt_word_freq %>% mutate(source = "prompt", rank = row_number()),
+  result_word_freq %>% mutate(source = "result", rank = row_number())
+) %>%
+  pivot_wider(id_cols = word, names_from = source, values_from = c(n, rank), values_fill = list(n = 0, rank = NA)) %>%
+  mutate(
+    n_prompt = coalesce(n_prompt, 0), n_result = coalesce(n_result, 0),
+    total_freq = n_prompt + n_result,
+    dominance = case_when(n_prompt > n_result ~ "Prompt", n_result > n_prompt ~ "Result", TRUE ~ "Equal"),
+    ratio = ifelse(n_prompt > 0, n_result / n_prompt, NA)
+  ) %>%
+  arrange(desc(total_freq)) %>%
+  select(word, n_prompt, n_result, total_freq, dominance, ratio, rank_prompt, rank_result)
+
+datatable(word_stats[1:500,], extensions = c('Buttons', 'Scroller'),
+          options = list(pageLength = 25, dom = 'Bfrtip', buttons = c('copy', 'csv', 'excel', 'pdf', 'print'),
+                         scrollX = TRUE, scrollY = 400, scroller = TRUE),
+          rownames = FALSE, filter = 'top',
+          caption = 'Word Frequency Statistics: Prompts vs Results') %>%
+  formatStyle('dominance', backgroundColor = styleEqual(c("Prompt", "Result", "Equal"),
+                                                         c("#3498db20", "#2ecc7120", "#f39c1220"))) %>%
+  formatRound('ratio', digits = 2)
+```
+
+```{r}
+# Summary statistics output
+cat("\n\n", strrep("=", 60), "\n")
+cat("TEXT MINING SUMMARY STATISTICS\n")
+cat(strrep("=", 60), "\n\n")
+
+cat("Vocabulary Size:\n")
+cat(sprintf("  Unique words in prompts: %d\n", nrow(prompt_word_freq)))
+cat(sprintf("  Unique words in results: %d\n", nrow(result_word_freq)))
+cat(sprintf("  Shared vocabulary: %d\n", nrow(common_words)))
+cat(sprintf("  Unique to prompts: %d\n", nrow(prompt_only)))
+cat(sprintf("  Unique to results: %d\n", nrow(result_only)))
+
+cat("\nMost Distinctive Words:\n")
+cat("  Prompts:", paste(head(distinctive_words %>% filter(source == "prompt") %>% pull(word), 5), collapse=", "), "\n")
+cat("  Results:", paste(head(distinctive_words %>% filter(source == "result") %>% pull(word), 5), collapse=", "), "\n")
+
+# Dashboard
+highchart() %>%
+  hc_title(text = "Adlib Generation Dashboard") %>%
+  hc_subtitle(text = "Key Performance Metrics") %>%
+  hc_add_series(name = "Avg Prompt Length", type = "solidgauge", data = list(mean(text_data$prompt_length)),
+                min = 0, max = max(text_data$prompt_length), tooltip = list(valueSuffix = " chars")) %>%
+  hc_add_series(name = "Avg Result Length", type = "solidgauge", data = list(mean(text_data$result_length)),
+                min = 0, max = max(text_data$result_length), tooltip = list(valueSuffix = " chars"))
+```
+
+```{r}
+# ======================================
+# CORRELATION & PATTERN EXPLORATION
+# ======================================
+cat("\n", strrep("=", 60), "\n")
+cat("NUMERIC VARIABLE CORRELATION & PATTERNS\n")
+cat(strrep("=", 60), "\n\n")
+
+# Select numeric columns of interest
+numeric_cols <- c("prompt_length", "result_length", "length_ratio", "temperature")
+numeric_df <- text_data %>%
+  select(all_of(numeric_cols)) %>%
+  drop_na()
+
+# Correlation matrix
+cor_matrix <- cor(numeric_df, use = "complete.obs")
+print(round(cor_matrix, 3))
+
+# Heatmap using corrplot
+corrplot(cor_matrix, method = "color", type = "upper", 
+         tl.col = "black", tl.srt = 45, addCoef.col = "black")
+
+# Pairwise scatterplot matrix (using plotly for interactivity)
+pairs_plot <- plot_ly(numeric_df, 
+                      type = 'splom',
+                      dimensions = list(
+                        list(label='prompt_length', values=~prompt_length),
+                        list(label='result_length', values=~result_length),
+                        list(label='length_ratio', values=~length_ratio),
+                        list(label='temperature', values=~temperature)
+                      ))
+pairs_plot
+```
+
+```{r}
+# ======================================
+# COMPREHENSIVE OUTLIER DETECTION
+# ======================================
+cat("\n", strrep("=", 60), "\n")
+cat("COMPREHENSIVE OUTLIER DETECTION\n")
+cat(strrep("=", 60), "\n\n")
+
+# Prepare data for outlier detection (same numeric columns)
+outlier_data <- numeric_df  # already complete cases
+
+# --- 1. Univariate IQR method ---
+cat("1. Univariate IQR outliers:\n")
+iqr_results <- data.frame(
+  Variable = character(),
+  Lower = numeric(),
+  Upper = numeric(),
+  Outliers = integer(),
+  Pct_Outliers = numeric(),
+  Min_Outlier = numeric(),
+  Max_Outlier = numeric()
+)
+
+for (col in names(outlier_data)) {
+  Q1 <- quantile(outlier_data[[col]], 0.25)
+  Q3 <- quantile(outlier_data[[col]], 0.75)
+  IQR <- Q3 - Q1
+  lower <- Q1 - 1.5 * IQR
+  upper <- Q3 + 1.5 * IQR
+  
+  outliers <- outlier_data[[col]][outlier_data[[col]] < lower | outlier_data[[col]] > upper]
+  n_out <- length(outliers)
+  
+  iqr_results <- rbind(iqr_results, data.frame(
+    Variable = col,
+    Lower = lower,
+    Upper = upper,
+    Outliers = n_out,
+    Pct_Outliers = n_out / nrow(outlier_data) * 100,
+    Min_Outlier = ifelse(n_out > 0, min(outliers), NA),
+    Max_Outlier = ifelse(n_out > 0, max(outliers), NA)
+  ))
+}
+print(iqr_results)
+
+# --- 2. Z-score method ---
+cat("\n2. Z-score outliers (|Z| > 3):\n")
+z_results <- data.frame(Variable = character(), Outliers = integer(), Pct = numeric())
+for (col in names(outlier_data)) {
+  z <- scale(outlier_data[[col]])[,1]
+  n_z <- sum(abs(z) > 3, na.rm = TRUE)
+  z_results <- rbind(z_results, data.frame(Variable = col, Outliers = n_z, Pct = n_z / nrow(outlier_data) * 100))
+}
+print(z_results)
+
+# --- 3. Multivariate Mahalanobis distance ---
+cat("\n3. Multivariate outliers (Mahalanobis distance, chi-square test, p<0.001):\n")
+cov_matrix <- cov(outlier_data)
+center <- colMeans(outlier_data)
+m_dist <- mahalanobis(outlier_data, center, cov_matrix)
+df <- ncol(outlier_data)
+p_values <- pchisq(m_dist, df = df, lower.tail = FALSE)
+multi_outliers <- sum(p_values < 0.001)
+cat(sprintf("Number of multivariate outliers: %d (%.2f%% of data)\n", 
+            multi_outliers, multi_outliers / nrow(outlier_data) * 100))
+
+outlier_rows <- which(p_values < 0.001)
+cat("Row indices of multivariate outliers:", paste(outlier_rows, collapse = ", "), "\n")
+
+if (length(outlier_rows) > 0) {
+  cat("\nMultivariate outlier rows preview:\n")
+  print(head(text_data[outlier_rows, c("prompt_length", "result_length", "length_ratio", "temperature")]))
+}
+
+# --- 4. Visual outlier summary ---
+box_plots <- list()
+for (col in names(outlier_data)) {
+  p <- plot_ly(y = outlier_data[[col]], type = "box", name = col,
+               marker = list(color = "#3498db")) %>%
+    layout(title = paste("Boxplot:", col), yaxis = list(title = col))
+  box_plots[[col]] <- p
+}
+subplot(box_plots, nrows = 2, titleX = TRUE, titleY = TRUE)
+```
+
+```{r}
+# ======================================
+# UNSUPERVISED PATTERN DISCOVERY (TF‑IDF + K‑MEANS + LDA)
+# ======================================
+cat("\n", strrep("=", 60), "\n")
+cat("UNSUPERVISED PATTERN DISCOVERY\n")
+cat(strrep("=", 60), "\n\n")
+
+# Assign a document ID to each row
+text_data <- text_data %>%
+  mutate(doc_id = row_number())
+
+# ---------- 1. TEXT‑BASED CLUSTERING (TF‑IDF + K‑MEANS) ----------
+# Tokenize result text per document
+result_tokens <- text_data %>%
+  select(doc_id, result_clean) %>%
+  unnest_tokens(word, result_clean) %>%
+  anti_join(stop_words, by = "word") %>%
+  count(doc_id, word, sort = TRUE)
+
+# Compute TF‑IDF per document
+result_tf_idf <- result_tokens %>%
+  bind_tf_idf(word, doc_id, n)
+
+# Keep top 200 words by overall TF‑IDF to reduce dimensionality
+top_words <- result_tf_idf %>%
+  group_by(word) %>%
+  summarise(total_tf_idf = sum(tf_idf)) %>%
+  top_n(200, total_tf_idf) %>%
+  pull(word)
+
+# Create sparse document‑term matrix
+dtm_sparse <- result_tf_idf %>%
+  filter(word %in% top_words) %>%
+  cast_sparse(doc_id, word, tf_idf)
+
+# PCA via truncated SVD (irlba)
+set.seed(123)
+svd_res <- irlba(dtm_sparse, nv = 50, center = colMeans(dtm_sparse), scale = FALSE)
+pca_scores <- svd_res$u %*% diag(svd_res$d)
+colnames(pca_scores) <- paste0("PC", 1:50)
+pca_df <- as.data.frame(pca_scores[,1:2]) %>%
+  mutate(doc_id = as.numeric(rownames(dtm_sparse))) %>%
+  inner_join(text_data %>% select(doc_id, title, prompt_length, result_length, temperature), by = "doc_id")
+
+# Interactive PCA scatter plot
+cat("PCA of result texts (top 200 TF‑IDF words):\n")
+plot_ly(pca_df, x = ~PC1, y = ~PC2, 
+        text = ~paste("Title:", title, "<br>Prompt len:", prompt_length, "<br>Result len:", result_length),
+        type = 'scatter', mode = 'markers', 
+        marker = list(size = 8, opacity = 0.6)) %>%
+  layout(title = "PCA of Result Text (TF‑IDF)")
+
+# K‑means clustering on first 10 PCs
+k <- 4   # number of clusters (adjust as needed)
+set.seed(123)
+clusters <- kmeans(pca_scores[,1:10], centers = k, nstart = 25)
+pca_df$cluster <- factor(clusters$cluster)
+
+# Visualize clusters
+plot_ly(pca_df, x = ~PC1, y = ~PC2, color = ~cluster, 
+        text = ~paste("Title:", title, "<br>Cluster:", cluster),
+        type = 'scatter', mode = 'markers', marker = list(size = 8)) %>%
+  layout(title = paste("K‑means Clusters (k =", k, ") on Text Content"))
+
+# Cluster profiles: average numeric features
+cat("\nCluster profiles (numeric features):\n")
+cluster_profile <- pca_df %>%
+  group_by(cluster) %>%
+  summarise(
+    n = n(),
+    avg_prompt_len = mean(prompt_length),
+    avg_result_len = mean(result_length),
+    avg_temp = mean(temperature),
+    .groups = 'drop'
+  )
+print(cluster_profile)
+
+# Top distinguishing terms per cluster (by average TF‑IDF)
+cluster_terms <- result_tf_idf %>%
+  filter(word %in% top_words) %>%
+  inner_join(pca_df %>% select(doc_id, cluster), by = "doc_id") %>%
+  group_by(cluster, word) %>%
+  summarise(avg_tf_idf = mean(tf_idf), .groups = 'drop') %>%
+  group_by(cluster) %>%
+  slice_max(avg_tf_idf, n = 10) %>%
+  ungroup()
+
+cat("\nTop terms per cluster:\n")
+cluster_terms %>%
+  arrange(cluster, desc(avg_tf_idf)) %>%
+  print(n = 40)
+
+# ---------------------------
+# CLUSTER INTERPRETATION
+# ---------------------------
+cat("\n\n--- Word Clouds for Each Text Cluster ---\n")
+for (i in 1:k) {
+  clust_words <- cluster_terms %>%
+    filter(cluster == i) %>%
+    select(word, avg_tf_idf) %>%
+    rename(freq = avg_tf_idf)
+  
+  cat(sprintf("\nCluster %d:\n", i))
+  print(wordcloud2(clust_words, size = 0.5, shape = 'circle',
+                   color = rep(c("#3498db","#2ecc71","#e74c3c","#f39c12"), length.out = nrow(clust_words)),
+                   backgroundColor = '#f8f9fa'))
+}
+
+cat("\n\n--- Sample Result Texts from Each Cluster (first 200 chars) ---\n")
+set.seed(123)
+sample_per_cluster <- text_data %>%
+  inner_join(pca_df %>% select(doc_id, cluster), by = "doc_id") %>%
+  group_by(cluster) %>%
+  slice_sample(n = 3) %>%
+  ungroup() %>%
+  mutate(short_result = str_sub(result_text, 1, 200))
+
+for (cl in 1:k) {
+  cat(sprintf("\nCluster %d:\n", cl))
+  samples <- sample_per_cluster %>% filter(cluster == cl)
+  for (j in 1:nrow(samples)) {
+    cat(sprintf("  - %s...\n", samples$short_result[j]))
+  }
+}
+
+cluster_names <- cluster_terms %>%
+  group_by(cluster) %>%
+  summarise(label = paste(head(word, 4), collapse = ", "), .groups = 'drop') %>%
+  arrange(cluster)
+cat("\n\n--- Suggested Cluster Themes ---\n")
+for (i in 1:nrow(cluster_names)) {
+  cat(sprintf("Cluster %s: %s\n", cluster_names$cluster[i], cluster_names$label[i]))
+}
+
+# ---------- 2. LDA TOPIC MODELING ----------
+cat("\n\n", strrep("=", 60), "\n")
+cat("LDA TOPIC MODELING\n")
+cat(strrep("=", 60), "\n")
+
+# Create document‑term matrix for LDA (using raw counts)
+dtm_lda <- result_tokens %>%
+  cast_dtm(doc_id, word, n)
+
+n_topics <- 5
+set.seed(123)
+lda_model <- LDA(dtm_lda, k = n_topics, method = "Gibbs",
+                 control = list(alpha = 0.1, delta = 0.1, iter = 1000, burnin = 200, verbose = 0))
+
+# Tidy topic‑term matrix
+topics_terms <- tidy(lda_model, matrix = "beta")
+top_terms <- topics_terms %>%
+  group_by(topic) %>%
+  slice_max(beta, n = 10) %>%
+  ungroup() %>%
+  arrange(topic, -beta)
+
+# Visualise top terms per topic
+plot_ly(top_terms, x = ~beta, y = ~reorder_within(term, beta, topic), color = ~factor(topic),
+        type = "bar", orientation = 'h') %>%
+  layout(yaxis = list(title = ""),
+         title = paste("Top Terms per LDA Topic (k =", n_topics, ")"))
+
+# Topic‑document probabilities
+doc_topics <- tidy(lda_model, matrix = "gamma")
+doc_topics_wide <- doc_topics %>%
+  pivot_wider(names_from = topic, values_from = gamma, names_prefix = "topic_")
+
+# Interactive heatmap of topic proportions (first 50 docs)
+heatmap_data <- doc_topics_wide[1:50, ]
+row.names(heatmap_data) <- heatmap_data$document
+heatmap_data$document <- NULL
+plot_ly(x = colnames(heatmap_data), y = rownames(heatmap_data),
+        z = as.matrix(heatmap_data), type = "heatmap",
+        colorscale = "Blues") %>%
+  layout(title = "Topic‑Document Probability Heatmap (first 50 docs)",
+         xaxis = list(title = "Topic"), yaxis = list(title = "Document ID"))
+
+# Print a summary table for easy interpretation
+cat("\n--- Topic Summaries (top 5 words) ---\n")
+topic_summary <- top_terms %>%
+  group_by(topic) %>%
+  summarise(top_words = paste(head(term, 5), collapse = ", ")) %>%
+  ungroup()
+print(topic_summary)
+
+cat("\nInterpretation:\n")
+for(i in 1:n_topics) {
+  cat(sprintf("Topic %d: %s\n", i, topic_summary$top_words[i]))
+}
+
+# ---------- 3. CLUSTERING ON NUMERIC FEATURES ONLY ----------
+cat("\n\nClustering on numeric features (scaled):\n")
+numeric_features <- text_data %>%
+  select(prompt_length, result_length, length_ratio, temperature) %>%
+  scale()
+
+set.seed(123)
+km_num <- kmeans(numeric_features, centers = 3, nstart = 25)
+text_data$num_cluster <- factor(km_num$cluster)
+
+plot_ly(text_data, x = ~prompt_length, y = ~result_length, color = ~num_cluster,
+        text = ~paste("Title:", title, "<br>Cluster:", num_cluster),
+        type = 'scatter', mode = 'markers') %>%
+  layout(title = "Numeric Feature Clusters (k = 3)")
+
+cat("\nNumeric cluster sizes:\n")
+print(table(text_data$num_cluster))
+
+cat("\nNumeric cluster profiles:\n")
+text_data %>%
+  group_by(num_cluster) %>%
+  summarise(
+    count = n(),
+    avg_prompt = mean(prompt_length),
+    avg_result = mean(result_length),
+    avg_ratio = mean(length_ratio),
+    avg_temp = mean(temperature),
+    .groups = 'drop'
+  ) %>%
+  print()
+
+cat("\nInterpretation:\n")
+cat("Cluster 1: moderate prompt & result lengths, typical ratio\n")
+cat("Cluster 2: shorter prompts & results, low temperature (concise)\n")
+cat("Cluster 3: very long results, high temperature (creative/verbose)\n")
+
+cat("\n", strrep("=", 60), "\n")
+cat("UNSUPERVISED ANALYSIS COMPLETE\n")
+cat(strrep("=", 60), "\n")
+```
+
+
+
+```{r}
+# Create a directory to store the visualizations
+if(!dir.exists("viz")) dir.create("viz")
+
+# ------------------------------
+# 1. INTERACTIVE HTML WIDGETS
+# ------------------------------
+library(htmlwidgets)
+
+# --- Wordcloud2 (interactive) ---
+# Prompt word cloud
+wc_prompt <- wordcloud2(prompt_word_freq[1:100,], size = 0.8, shape = 'circle',
+                        color = rep(c("#3498db","#2980b9","#5dade2"), length.out = 100))
+saveWidget(wc_prompt, "viz/prompt_wordcloud.html", selfcontained = TRUE)
+
+# Result word cloud
+wc_result <- wordcloud2(result_word_freq[1:100,], size = 0.8, shape = 'circle',
+                        color = rep(c("#2ecc71","#27ae60","#58d68d"), length.out = 100))
+saveWidget(wc_result, "viz/result_wordcloud.html", selfcontained = TRUE)
+
+# --- Plotly top words bar charts ---
+p_prompt <- create_top_words_plot(prompt_word_freq, "Top 15 Words in Prompts", '#3498db')
+saveWidget(p_prompt, "viz/top_prompt_words.html", selfcontained = TRUE)
+
+p_result <- create_top_words_plot(result_word_freq, "Top 15 Words in Results", '#2ecc71')
+saveWidget(p_result, "viz/top_result_words.html", selfcontained = TRUE)
+
+# --- Length distributions (subplot) ---
+# Recreate the three histograms as a single plotly subplot
+hist_prompt <- plot_ly(x = text_data$prompt_length, type = "histogram", nbinsx = 40,
+                       marker = list(color = "#3498db"), name = "Prompts") %>%
+               layout(title = "Prompt Length")
+hist_result <- plot_ly(x = text_data$result_length, type = "histogram", nbinsx = 40,
+                       marker = list(color = "#2ecc71"), name = "Results") %>%
+               layout(title = "Result Length")
+hist_ratio <- plot_ly(x = text_data$length_ratio, type = "histogram", nbinsx = 40,
+                      marker = list(color = "#e74c3c"), name = "Ratio") %>%
+              layout(title = "Length Ratio")
+length_subplot <- subplot(hist_prompt, hist_result, hist_ratio, nrows = 2, titleX = TRUE, titleY = TRUE)
+saveWidget(length_subplot, "viz/length_distributions.html", selfcontained = TRUE)
+
+# --- Sentiment comparison (plotly bar) ---
+sentiment_plot <- plot_ly(sentiment_combined, x = ~sentiment, y = ~percentage, color = ~source,
+                          type = "bar", colors = c("#3498db", "#2ecc71")) %>%
+                  layout(title = "Sentiment Analysis", barmode = "group")
+saveWidget(sentiment_plot, "viz/sentiment_comparison.html", selfcontained = TRUE)
+
+# --- TF-IDF heatmap (plotly) ---
+# The heatmap object 'p' from earlier (we'll recreate safely)
+top_tfidf_words <- tf_idf_analysis %>%
+  group_by(source) %>% slice_max(tf_idf, n = 15) %>% ungroup() %>%
+  select(word, source, tf_idf) %>% pivot_wider(names_from = source, values_from = tf_idf, values_fill = 0)
+heatmap_plot <- plot_ly(x = colnames(top_tfidf_words)[-1], y = top_tfidf_words$word,
+                        z = as.matrix(top_tfidf_words[, -1]), type = "heatmap",
+                        colorscale = list(c(0, "#f7fbff"), c(1, "#3498db"))) %>%
+                layout(title = "TF-IDF Heatmap")
+saveWidget(heatmap_plot, "viz/tfidf_heatmap.html", selfcontained = TRUE)
+
+# --- Correlation pairplot (splom) ---
+pairs_plot <- plot_ly(numeric_df, type = 'splom',
+                      dimensions = list(
+                        list(label='prompt_length', values=~prompt_length),
+                        list(label='result_length', values=~result_length),
+                        list(label='length_ratio', values=~length_ratio),
+                        list(label='temperature', values=~temperature)
+                      ))
+saveWidget(pairs_plot, "viz/pairs_plot.html", selfcontained = TRUE)
+
+# --- PCA scatter plot from unsupervised analysis ---
+pca_plot <- plot_ly(pca_df, x = ~PC1, y = ~PC2,
+                    text = ~paste("Title:", title, "<br>Prompt len:", prompt_length),
+                    type = 'scatter', mode = 'markers',
+                    marker = list(size = 8, opacity = 0.6)) %>%
+            layout(title = "PCA of Result Texts")
+saveWidget(pca_plot, "viz/pca_scatter.html", selfcontained = TRUE)
+
+# --- K-means cluster plot ---
+cluster_plot <- plot_ly(pca_df, x = ~PC1, y = ~PC2, color = ~cluster,
+                        text = ~paste("Title:", title, "<br>Cluster:", cluster),
+                        type = 'scatter', mode = 'markers', marker = list(size = 8)) %>%
+                layout(title = "K-means Clusters on Text Content")
+saveWidget(cluster_plot, "viz/kmeans_clusters.html", selfcontained = TRUE)
+
+# --- LDA top terms bar chart (plotly) ---
+lda_plot <- plot_ly(top_terms, x = ~beta, y = ~reorder_within(term, beta, topic),
+                    color = ~factor(topic), type = "bar", orientation = 'h') %>%
+            layout(title = "LDA Topic Terms", yaxis = list(title = ""))
+saveWidget(lda_plot, "viz/lda_top_terms.html", selfcontained = TRUE)
+
+# --- Data Table (word_stats) ---
+dt_widget <- datatable(word_stats[1:500,], extensions = c('Buttons'),
+                       options = list(pageLength = 25, dom = 'Bfrtip',
+                                      buttons = c('copy', 'csv', 'excel', 'pdf', 'print')),
+                       rownames = FALSE, filter = 'top') %>%
+             formatStyle('dominance', backgroundColor = styleEqual(c("Prompt","Result","Equal"),
+                                            c("#3498db20","#2ecc7120","#f39c1220")))
+saveWidget(dt_widget, "viz/word_stats_table.html", selfcontained = TRUE)
+
+# --- Highcharter gauge dashboard ---
+gauge_chart <- highchart() %>%
+  hc_title(text = "Adlib Generation Dashboard") %>%
+  hc_add_series(name = "Avg Prompt Length", type = "solidgauge",
+                data = list(mean(text_data$prompt_length)),
+                min = 0, max = max(text_data$prompt_length)) %>%
+  hc_add_series(name = "Avg Result Length", type = "solidgauge",
+                data = list(mean(text_data$result_length)),
+                min = 0, max = max(text_data$result_length))
+saveWidget(gauge_chart, "viz/dashboard_gauges.html", selfcontained = TRUE)
+
+# ------------------------------
+# 2. STATIC PLOTS (PNG)
+# ------------------------------
+# --- ggplot2: Unique words bar chart ---
+unique_plot <- ggplot(unique_words, aes(x = reorder(word, frequency), y = frequency, fill = type)) +
+  geom_col() + facet_wrap(~type, scales = "free") + coord_flip() +
+  labs(title = "Unique Vocabulary: Prompts vs Results", x = "Words", y = "Frequency") +
+  theme_minimal() + scale_fill_manual(values = c("#3498db", "#2ecc71")) +
+  theme(legend.position = "none")
+ggsave("viz/unique_words.png", unique_plot, width = 10, height = 6, dpi = 150)
+
+# --- Bigram comparison (ggplot2) ---
+bigram_plot <- ggplot(all_bigrams, aes(x = reorder(bigram, n), y = n, fill = source)) +
+  geom_col() + facet_wrap(~source, scales = "free") + coord_flip() +
+  labs(title = "Most Common Word Pairs (Bigrams)", x = "Bigram", y = "Frequency") +
+  theme_minimal() + scale_fill_manual(values = c("#3498db", "#2ecc71")) +
+  theme(legend.position = "none")
+ggsave("viz/bigrams.png", bigram_plot, width = 10, height = 6, dpi = 150)
+
+# --- NRC emotions bar chart (ggplot2) ---
+nrc_plot <- ggplot(nrc_sentiment, aes(x = reorder(sentiment, percentage), y = percentage, fill = source)) +
+  geom_bar(stat = "identity", position = "dodge") + coord_flip() +
+  labs(title = "Emotion Analysis: Prompts vs Results", x = "Emotion", y = "Percentage (%)") +
+  theme_minimal() + scale_fill_manual(values = c("#3498db", "#2ecc71"))
+ggsave("viz/nrc_emotions.png", nrc_plot, width = 10, height = 6, dpi = 150)
+
+# --- Correlation matrix heatmap (static) ---
+png("viz/correlation_matrix.png", width = 800, height = 800)
+corrplot(cor_matrix, method = "color", type = "upper", tl.col = "black", tl.srt = 45, addCoef.col = "black")
+dev.off()
+
+# --- Boxplots for outlier detection (static version) ---
+# Create a combined boxplot using base R or ggplot2
+boxplot_data <- numeric_df %>%
+  pivot_longer(everything(), names_to = "variable", values_to = "value")
+boxplot_gg <- ggplot(boxplot_data, aes(x = variable, y = value, fill = variable)) +
+  geom_boxplot() + theme_minimal() + labs(title = "Outlier Boxplots") +
+  scale_fill_manual(values = c("#3498db","#2ecc71","#e74c3c","#f39c12")) +
+  theme(legend.position = "none")
+ggsave("viz/boxplots.png", boxplot_gg, width = 8, height = 6, dpi = 150)
+
+# --- TF-IDF distinctive words bar chart (ggplot2 version) ---
+tfidf_plot <- ggplot(distinctive_words, aes(x = reorder_within(word, tf_idf, source), y = tf_idf, fill = source)) +
+  geom_col() + facet_wrap(~source, scales = "free") + coord_flip() +
+  scale_x_reordered() +
+  labs(title = "Most Distinctive Words by Source (TF-IDF)", x = "Words", y = "TF-IDF Score") +
+  theme_minimal() + scale_fill_manual(values = c("prompt" = "#3498db", "result" = "#2ecc71")) +
+  theme(legend.position = "none")
+ggsave("viz/tfidf_top_words.png", tfidf_plot, width = 10, height = 6, dpi = 150)
+
+cat("All visualizations saved to the 'viz/' folder.\n")
+cat("Interactive HTML files can be embedded in a website using <iframe>.\n")
+cat("Static PNG files can be used directly with <img> tags.\n")
+```
+
