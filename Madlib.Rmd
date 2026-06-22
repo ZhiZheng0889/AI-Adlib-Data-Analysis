@@ -101,7 +101,7 @@ tokenize_words <- function(df, text_column, id_column = "id") {
 
 ```{r}
 # Load data
-data_dir <- "C:/Users/zhizh/Downloads/"
+data_dir <- "data"
 data_list <- load_and_clean_data(data_dir)
 
 # Assign individual data frames

@@ -7,7 +7,7 @@ library(ggplot2)
 library(DT)
 
 # ── Database connection ────────────────────────────────────────────────────────
-db_path <- "C:/Users/zhizh/OneDrive/Desktop/adlibs.db"
+db_path <- file.path("..", "data", "adlibs.db")
 get_con <- function() dbConnect(SQLite(), db_path)
 
 # ── Pre-load summary data ──────────────────────────────────────────────────────
