@@ -134,29 +134,71 @@ The SQLite app queries `adlibs`, `ai_adlibs`, `adlib_results`, `ai_categories`, 
 
 The source files currently contain author-specific Windows paths; make the edits above before running them. No package lockfile or automated test suite is included, so package versions are not pinned. The committed HTML files provide saved results if you only want to explore the analysis without setting up its R dependencies.
 
+## Highlights
+
+- Compare vocabulary, phrase patterns, and response lengths across human and AI adlibs.
+- Explore sentiment and NRC emotion distributions.
+- Analyze TF-IDF terms, principal components, clusters, and LDA topics.
+- Browse exported static and interactive visualizations.
+- Run a Shiny dashboard backed by the included SQLite database.
+
+## Repository Structure
+
+```text
+.
+├── data/                    # CSV exports and SQLite database
+├── adlibs_dashboard/        # Standalone Shiny application
+├── reports/                 # Rendered R Markdown reports
+├── viz/                     # Exported charts and HTML widgets
+├── Madlib.Rmd               # Main exploratory analysis
+├── Madlib-Dashboard.Rmd     # Interactive notebook dashboard
+└── README.md
+```
+
+Generated HTML widget dependency folders are stored alongside their corresponding files in `viz/`.
+
+## Getting Started
+
+### Prerequisites
+
+Install [R](https://www.r-project.org/) and an R Markdown-capable editor such as [RStudio](https://posit.co/download/rstudio-desktop/). The analysis uses packages from the tidyverse and text-analysis ecosystem, including `tidyverse`, `tidytext`, `plotly`, `DT`, `textdata`, `topicmodels`, and `wordcloud2`.
+
+The standalone Shiny app requires `shiny`, `bslib`, `DBI`, `RSQLite`, `dplyr`, `ggplot2`, and `DT`.
+
+### Run the Analysis
+
+Open `Madlib.Rmd` in RStudio and select **Knit**, or run:
+
+```r
+rmarkdown::render("Madlib.Rmd", output_dir = "reports")
+```
+
+The notebook reads repository-relative files from `data/` and exports visualizations to `viz/`.
+
+### Run the Dashboard
+
+From the repository root, run:
+
+```r
+shiny::runApp("adlibs_dashboard")
+```
+
+The app reads `data/adlibs.db`; no machine-specific path configuration is required.
+
 ## Visualization Gallery
 
-## Static Visualizations (PNG)
+### Static Visualizations
 
-### Unique Word Usage
-![Unique words comparison](viz/unique_words.png)
+| Analysis | Preview |
+| --- | --- |
+| Unique word usage | ![Unique words comparison](viz/unique_words.png) |
+| Bigram comparison | ![Bigram comparison](viz/bigrams.png) |
+| NRC emotion distribution | ![NRC emotions](viz/nrc_emotions.png) |
+| Correlation matrix | ![Correlation matrix](viz/correlation_matrix.png) |
+| Outlier boxplots | ![Outlier boxplots](viz/boxplots.png) |
+| Top TF-IDF words | ![Top TF-IDF words](viz/tfidf_top_words.png) |
 
-### Bigram Comparison
-![Bigram comparison](viz/bigrams.png)
-
-### NRC Emotion Distribution
-![NRC emotions](viz/nrc_emotions.png)
-
-### Correlation Matrix
-![Correlation matrix](viz/correlation_matrix.png)
-
-### Outlier Boxplots
-![Outlier boxplots](viz/boxplots.png)
-
-### Top TF-IDF Words
-![Top TF-IDF words](viz/tfidf_top_words.png)
-
-## Interactive Visualizations (HTML)
+### Interactive Visualizations
 
 - [Prompt Word Cloud](viz/prompt_wordcloud.html)
 - [Result Word Cloud](viz/result_wordcloud.html)

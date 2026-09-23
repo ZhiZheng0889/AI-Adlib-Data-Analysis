@@ -40,11 +40,11 @@ COLOR_SCHEMES <- list(
 DEFAULT_MIN_FREQ <- 10
 MAX_WORDS_CLOUD <- 150
 
-# Source file paths (UPDATE THIS PATH)
+# Repository-relative source file paths
 DATA_PATHS <- list(
-  adlibs = "C:/Users/zhizh/Downloads/adlib_rows.csv",
-  ai_adlibs = "C:/Users/zhizh/Downloads/ai_adlibs_adlibs_rows (1).csv",
-  results = "C:/Users/zhizh/Downloads/ai_adlibs_adlib_results_rows.csv"
+  adlibs = "data/adlib_rows.csv",
+  ai_adlibs = "data/ai_adlibs_adlibs_rows (1).csv",
+  results = "data/ai_adlibs_adlib_results_rows.csv"
 )
 
 cat("✅ Global setup complete\n")
